@@ -6,7 +6,7 @@ from datetime import timedelta
 
 DOMAIN = "energiebe"
 
-URL = "https://energie.be/"
+URL = "https://energie.be/nl/tarief"
 
 # Atrias publishes the official Belgian gross calorific values per GOS (gas
 # reception station), one file per month. See atrias.py for the details.

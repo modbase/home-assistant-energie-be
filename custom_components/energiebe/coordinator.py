@@ -54,10 +54,10 @@ class EnergieBeData:
         return self.gas_kwh * self.gas_conversion_factor
 
 
-_ORDER_PATTERN = re.compile(r"order:\s*(\d+)")
+_ORDER_PATTERN = re.compile(r"order:\s*(-?\d+)")
 
 # The price cards carry no label of their own; the only thing naming a fuel is
-# the switch button above them, which reads "Elektriciteit | Gas | Zonne-energie".
+# the radio picker beside them, which reads "Elektriciteit | Gas | Zonne-energie".
 # energie.be is Dutch only -- it sends lang="nl", ignores Accept-Language and has
 # no localised routes -- so there is nothing else to match on. If the wording ever
 # changes we fall through to the rendered order and log about it.
@@ -89,37 +89,68 @@ def _fuel_for(label: str) -> str | None:
     return None
 
 
+def _price_element(item: Tag) -> Tag | None:
+    """Return the div holding one card's variable tariff.
+
+    A card renders three figures in the same ``ui-large`` class -- the
+    "% goedkoper" badge, the variable tariff and the yearly standing charge --
+    so key on the label sitting beside the number, not on the class alone.
+    """
+    for label in item.find_all("div", class_="d-inline-block"):
+        if "kwh" not in label.get_text().casefold():
+            continue
+        parent = label.parent
+        if isinstance(parent, Tag):
+            value = parent.find("div", class_="ui-large")
+            if isinstance(value, Tag):
+                return value
+    return None
+
+
 def _cards(soup: BeautifulSoup) -> list[_Card]:
-    """Read every price card with the flex order the page renders it at.
+    """Read every price card, keyed by the position the page lays it out at.
 
     DOM order and the CSS ``order`` property are allowed to disagree -- the
-    latter is what the page actually lays out, so that is what we key on.
+    latter is what the page actually lays out, so rank on it and hand back
+    contiguous positions that the fuel labels can be indexed against.
     """
-    cards: list[_Card] = []
+    found: list[tuple[int, int, float]] = []
     for index, item in enumerate(soup.find_all("app-fair-price-item")):
-        element = item.find("div", class_="big-price")
+        element = _price_element(item)
         if not isinstance(element, Tag):
             continue
         try:
-            # Tariffs are rendered as c€/kWh, e.g. " 15,98 ".
+            # Tariffs are rendered as c€/kWh, e.g. " 18,77 ".
             value = float(element.get_text().strip().replace(",", ".")) / 100
         except ValueError:
             continue
         match = _ORDER_PATTERN.search(str(item.get("style") or ""))
-        cards.append(_Card(order=int(match.group(1)) if match else index, value=value))
-    return cards
+        found.append((int(match.group(1)) if match else index, index, value))
+
+    found.sort(key=lambda entry: (entry[0], entry[1]))
+    return [
+        _Card(order=position, value=value)
+        for position, (_, _, value) in enumerate(found)
+    ]
 
 
 def _labels(soup: BeautifulSoup) -> list[str]:
-    """Read the fuel names from the switch button, in the order it shows them."""
-    switch = soup.find("app-switch-button")
-    if not isinstance(switch, Tag):
+    """Read the fuel names from the radio picker, in the order it shows them.
+
+    Scoped to the tariff section: the page carries a second, unrelated picker
+    ("Particulier | Professioneel") that must not shift the fuel indices.
+    """
+    section = soup.find("app-fair-price")
+    if not isinstance(section, Tag):
         return []
-    return [span.get_text().strip() for span in switch.find_all("span", class_="option")]
+    return [
+        element.get_text().strip()
+        for element in section.find_all(class_="radio-label")
+    ]
 
 
 def _parse_prices(html: str) -> dict[str, float]:
-    """Pull the tariffs off the Energie.be landing page.
+    """Pull the tariffs off the Energie.be tariff page.
 
     Runs in the executor: this parses roughly 800 kB of markup, which is far too
     much blocking work to do on the event loop.
@@ -192,7 +223,7 @@ class EnergieBeCoordinator(DataUpdateCoordinator[EnergieBeData]):
         )
 
     async def _async_scrape_prices(self) -> dict[str, float]:
-        """Fetch and parse the Energie.be landing page."""
+        """Fetch and parse the Energie.be tariff page."""
         try:
             async with self._session.get(
                 URL, timeout=aiohttp.ClientTimeout(total=30)
