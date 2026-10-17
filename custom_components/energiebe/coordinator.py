@@ -6,6 +6,7 @@ import logging
 import re
 import ssl
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup, Tag
@@ -27,6 +28,7 @@ from .const import (
     CONF_GOS_EAN,
     DOMAIN,
     FALLBACK_GAS_CONVERSION_FACTOR,
+    MAX_SCRAPE_ATTEMPTS,
     RETRY_INTERVAL,
     UPDATE_INTERVAL,
     URL,
@@ -66,6 +68,13 @@ _FUEL_KEYWORDS: dict[str, tuple[str, ...]] = {
     "gas_kwh": ("gas",),
     "injection": ("zonne", "injectie"),
 }
+
+# The one element that only the tariff page carries. Its absence means the
+# instance served us some other page, which is a different fault from markup we
+# cannot parse -- worth another roll of the dice rather than a day of waiting.
+_TARIFF_MARKER = "app-fair-price-item"
+
+_SCRAPE_HOST = urlparse(URL).hostname or ""
 
 # A tariff outside this band means we read the wrong element, or the page
 # stopped quoting c€/kWh. Either way, better to fail than to publish it.
@@ -224,22 +233,51 @@ class EnergieBeCoordinator(DataUpdateCoordinator[EnergieBeData]):
 
     async def _async_scrape_prices(self) -> dict[str, float]:
         """Fetch and parse the Energie.be tariff page."""
-        try:
-            async with self._session.get(
-                URL, timeout=aiohttp.ClientTimeout(total=30)
-            ) as response:
-                response.raise_for_status()
-                html = await response.text()
-        except TimeoutError as err:
-            raise UpdateFailed(
-                f"Timeout fetching {URL}", retry_after=_RETRY_AFTER
-            ) from err
-        except aiohttp.ClientError as err:
-            raise UpdateFailed(
-                f"Error fetching {URL}: {err}", retry_after=_RETRY_AFTER
-            ) from err
-
+        html = await self._async_fetch_tariff_page()
         return await self.hass.async_add_executor_job(_parse_prices, html)
+
+    async def _async_fetch_tariff_page(self) -> str:
+        """Return the tariff page, reasking until an instance serves it.
+
+        See MAX_SCRAPE_ATTEMPTS: the site load-balances across instances whose
+        caches hold each other's pages, so asking again is the only way through
+        -- but only if we shed the affinity cookie first, otherwise every retry
+        goes back to the same instance and gets the same wrong page.
+        """
+        for attempt in range(1, MAX_SCRAPE_ATTEMPTS + 1):
+            self._session.cookie_jar.clear_domain(_SCRAPE_HOST)
+            try:
+                async with self._session.get(
+                    URL, timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    response.raise_for_status()
+                    html = await response.text()
+            except TimeoutError as err:
+                raise UpdateFailed(
+                    f"Timeout fetching {URL}", retry_after=_RETRY_AFTER
+                ) from err
+            except aiohttp.ClientError as err:
+                raise UpdateFailed(
+                    f"Error fetching {URL}: {err}", retry_after=_RETRY_AFTER
+                ) from err
+
+            if _TARIFF_MARKER in html:
+                if attempt > 1:
+                    _LOGGER.debug(
+                        "Got the Energie.be tariff page on attempt %s of %s",
+                        attempt,
+                        MAX_SCRAPE_ATTEMPTS,
+                    )
+                return html
+
+        # Every instance we reached served something else. That is the site
+        # misbehaving rather than markup we need to relearn, so come back in
+        # half an hour instead of waiting for tomorrow's slot.
+        raise UpdateFailed(
+            f"{URL} served a page without {_TARIFF_MARKER} on all "
+            f"{MAX_SCRAPE_ATTEMPTS} attempts",
+            retry_after=_RETRY_AFTER,
+        )
 
     async def _async_conversion_factor(self) -> tuple[float, str]:
         """Return the m³ conversion factor and where it came from."""
